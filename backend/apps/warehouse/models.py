@@ -3,6 +3,7 @@
 """
 from django.db import models
 from apps.authentication.models import User
+from apps.delegation.models import DelegationPolicy, RISK_LEVEL_CHOICES
 
 
 class Unit(models.Model):
@@ -175,7 +176,18 @@ class StockOut(models.Model):
     receiver = models.CharField('领用人', max_length=100)
     receiver_dept = models.CharField('领用部门', max_length=100, blank=True)
     quantity = models.DecimalField('出库数量', max_digits=12, decimal_places=2)
+    # 审批授权范围判定依据：单笔金额与风险等级（缺省视为普通/无金额限制）
+    amount = models.DecimalField(
+        '涉及金额', max_digits=14, decimal_places=2, null=True, blank=True)
+    risk_level = models.CharField(
+        '风险等级', max_length=20, blank=True, default='normal',
+        choices=RISK_LEVEL_CHOICES)
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
+    # 审批负责人：审批权的原始持有人；其出差时由代理人凭授权处理
+    approver_owner = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='owned_stock_outs', verbose_name='审批负责人'
+    )
     stock_out_time = models.DateTimeField('出库时间', null=True, blank=True)
     remark = models.TextField('备注', blank=True)
     created_at = models.DateTimeField('创建时间', auto_now_add=True)
@@ -224,25 +236,37 @@ class Approval(models.Model):
         ('approved', '已通过'),
         ('rejected', '已拒绝'),
     ]
-    
+
     stock_out = models.ForeignKey(
         StockOut, on_delete=models.CASCADE,
         related_name='approvals', verbose_name='出库记录'
     )
+    # 名义审批人：审批权的原始持有人（本人审批时即实际操作者）
     approver = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True,
-        related_name='approvals', verbose_name='审批人'
+        related_name='approvals', verbose_name='原审批人/授权人'
     )
+    # 实际操作者：登录系统点击审批的人；与 approver 不同即为代理审批
+    actor = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='acted_approvals', verbose_name='实际操作者'
+    )
+    delegation = models.ForeignKey(
+        DelegationPolicy, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='approvals', verbose_name='代理授权依据'
+    )
+    authority_chain = models.JSONField('授权链快照', default=dict, blank=True)
+    is_delegated = models.BooleanField('是否代理审批', default=False)
     status = models.CharField('审批状态', max_length=20, choices=STATUS_CHOICES, default='pending')
     remark = models.TextField('审批意见', blank=True)
     created_at = models.DateTimeField('创建时间', auto_now_add=True)
     updated_at = models.DateTimeField('更新时间', auto_now=True)
-    
+
     class Meta:
         db_table = 'wh_approval'
         verbose_name = '审批记录'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
-    
+
     def __str__(self):
         return f"{self.stock_out} - {self.get_status_display()}"

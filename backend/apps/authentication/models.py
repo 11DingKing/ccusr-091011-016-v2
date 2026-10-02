@@ -65,7 +65,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     
     def __str__(self):
         return self.username
-    
+
+    @property
+    def display_name(self):
+        """展示名：优先真实姓名，缺省回退用户名。"""
+        return self.real_name or self.username
+
     @property
     def is_super_admin(self):
         """是否是超级管理员（ID=1且角色为superadmin）"""

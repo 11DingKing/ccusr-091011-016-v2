@@ -6,7 +6,11 @@ from rest_framework.test import APIClient
 
 from apps.authentication.backends import generate_token
 from apps.authentication.models import User
+from apps.delegation.models import DelegationPolicy
 from .models import Approval, Category, Goods, StockIn, StockOut, Unit, Variety, Warning
+from .approval_service import ApprovalError, perform_approval
+from django.utils import timezone
+from datetime import timedelta
 
 
 class WarehouseFixture(TestCase):
@@ -90,3 +94,89 @@ class WarehouseAPITest(WarehouseFixture):
     def test_requires_authentication(self):
         anonymous = APIClient().get("/api/units/")
         self.assertEqual(anonymous.status_code, 401)
+
+
+class StockOutApprovalTest(WarehouseFixture):
+    """出库申请-审批（含代理授权）端到端测试"""
+
+    def setUp(self):
+        super().setUp()
+        self.boss = User.objects.create_user("boss-x", "p", role="admin", real_name="周审批")
+        self.agent = User.objects.create_user("agent-x", "p", role="user", real_name="吴代办")
+
+    def _create_stock_out(self, client=None, owner=None):
+        client = client or self.client
+        return client.post("/api/stock-out/", {
+            "goods": self.goods.id,
+            "receiver": "使用人",
+            "quantity": "1",
+            "amount": "100",
+            "risk_level": "normal",
+            "approver_owner": (owner or self.boss).id,
+        }, format="json")
+
+    def test_create_stock_out(self):
+        resp = self._create_stock_out()
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["approver_owner"], self.boss.id)
+
+    def test_owner_approve_api(self):
+        so_id = self._create_stock_out().json()["data"]["id"]
+        boss_client = APIClient()
+        boss_client.credentials(HTTP_AUTHORIZATION=f"Bearer {generate_token(self.boss)}")
+        resp = boss_client.post(f"/api/stock-out/{so_id}/approval/",
+                               {"decision": "approved"}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertFalse(data["is_delegated"])
+        self.assertEqual(data["actor"], self.boss.id)
+        self.assertEqual(data["approver"], self.boss.id)
+        self.assertIn("本人审批", data["authority_description"])
+
+    def test_delegated_approval_api(self):
+        DelegationPolicy.objects.create(
+            principal=self.boss, agent=self.agent,
+            end_time=timezone.now() + timedelta(hours=8))
+        so_id = self._create_stock_out().json()["data"]["id"]
+
+        agent_client = APIClient()
+        agent_client.credentials(HTTP_AUTHORIZATION=f"Bearer {generate_token(self.agent)}")
+        resp = agent_client.post(f"/api/stock-out/{so_id}/approval/",
+                                {"decision": "approved", "remark": "出差代办"},
+                                format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertTrue(data["is_delegated"])
+        self.assertEqual(data["actor"], self.agent.id)       # 实际操作者
+        self.assertEqual(data["approver"], self.boss.id)    # 原授权人
+        self.assertIn("代理人", data["authority_description"])
+        self.assertIn("原授权人", data["authority_description"])
+
+    def test_list_shows_current_handler(self):
+        DelegationPolicy.objects.create(
+            principal=self.boss, agent=self.agent,
+            end_time=timezone.now() + timedelta(hours=8))
+        self._create_stock_out()
+        resp = self.client.get("/api/stock-out/?status=pending")
+        row = resp.json()["data"]["list"][0]
+        self.assertEqual(row["current_handler"]["user_id"], self.agent.id)
+        self.assertEqual(row["current_handler"]["kind"], "delegated")
+
+    def test_agent_without_delegation_forbidden(self):
+        so_id = self._create_stock_out().json()["data"]["id"]
+        agent_client = APIClient()
+        agent_client.credentials(HTTP_AUTHORIZATION=f"Bearer {generate_token(self.agent)}")
+        resp = agent_client.post(f"/api/stock-out/{so_id}/approval/",
+                                {"decision": "approved"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_revoked_delegation_forbidden(self):
+        policy = DelegationPolicy.objects.create(
+            principal=self.boss, agent=self.agent,
+            end_time=timezone.now() + timedelta(hours=8))
+        so = StockOut.objects.create(
+            goods=self.goods, operator=self.user, receiver="r",
+            quantity=Decimal("1"), approver_owner=self.boss)
+        policy.revoke()
+        with self.assertRaises(ApprovalError):
+            perform_approval(so, self.agent, "approved")

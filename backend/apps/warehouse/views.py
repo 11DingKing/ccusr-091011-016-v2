@@ -15,8 +15,14 @@ from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
-    GoodsSerializer, StockInSerializer, StockOutSerializer,
+    GoodsSerializer, StockInSerializer,
+    StockOutSerializer, StockOutCreateSerializer, ApprovalDecisionSerializer,
     WarningSerializer, ApprovalSerializer
+)
+from .approval_service import (
+    ApprovalError,
+    find_current_handler,
+    perform_approval,
 )
 
 logger = logging.getLogger('apps')
@@ -600,39 +606,209 @@ class StockInListView(APIView):
 
 
 class StockOutListView(APIView):
-    """出库记录列表视图"""
+    """出库申请列表 / 创建出库申请"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        qs = StockOut.objects.select_related(
+            'goods', 'operator', 'approver_owner').all()
+
+        status = request.query_params.get('status')
+        if status:
+            qs = qs.filter(status=status)
+        risk = request.query_params.get('risk_level')
+        if risk:
+            qs = qs.filter(risk_level=risk)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        total = qs.count()
+        items = qs[start:start + page_size]
+
+        # 为每张待审批单据附上当前可处理人（撤销/到期后会自动换人的结果）
+        list_data = StockOutSerializer(items, many=True).data
+        for row, obj in zip(list_data, items):
+            if obj.status == 'pending':
+                handler = find_current_handler(obj)
+                row['current_handler'] = None
+                if handler['user']:
+                    row['current_handler'] = {
+                        'kind': handler['kind'],
+                        'user_id': handler['user'].id,
+                        'name': handler['user'].display_name,
+                        'owner_id': handler['owner'].id if handler['owner'] else None,
+                        'owner_name': handler['owner'].display_name if handler['owner'] else None,
+                        'policy_id': handler['policy'].id if handler['policy'] else None,
+                    }
+            else:
+                row['current_handler'] = None
+
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': list_data, 'total': total, 'page': page, 'page_size': page_size
+        })
+
+    def post(self, request):
+        serializer = StockOutCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = _first_error(errors)
+            return error_response(message=first_error)
+
+        data = serializer.validated_data
+        owner_id = data.get('approver_owner')
+        owner = None
+        if owner_id:
+            from apps.authentication.models import User
+            owner = User.objects.filter(pk=owner_id, is_active=True).first()
+
+        stock_out = StockOut.objects.create(
+            goods_id=data['goods'],
+            operator=request.user,
+            receiver=data['receiver'],
+            receiver_dept=data.get('receiver_dept', ''),
+            quantity=data['quantity'],
+            amount=data.get('amount'),
+            risk_level=data.get('risk_level', 'normal'),
+            approver_owner=owner,
+            remark=data.get('remark', ''),
+        )
+
+        handler = find_current_handler(stock_out)
+        logger.info(
+            "用户 %s 提交出库申请 #%s，当前处理人 %s（%s）",
+            request.user.username, stock_out.id,
+            handler['user'].username if handler['user'] else '无',
+            handler['kind'] or '无人可处理',
+        )
+        return success_response(
+            data=StockOutSerializer(stock_out).data, message='申请已提交')
+
+
+def _first_error(errors):
+    first = next(iter(errors.values()))
+    if isinstance(first, dict):
+        return _first_error(first)
+    return str(first[0])
+
+
+class StockOutDetailView(APIView):
+    """出库单详情（含当前合法处理人与完整审批/授权链）"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            stock_out = StockOut.objects.select_related(
+                'goods', 'operator', 'approver_owner').get(pk=pk)
+        except StockOut.DoesNotExist:
+            return error_response(message='出库单不存在', code=404)
+
+        approvals = stock_out.approvals.select_related(
+            'approver', 'actor', 'delegation').order_by('created_at')
+        handler = find_current_handler(stock_out)
+        return success_response(data={
+            'stock_out': StockOutSerializer(stock_out).data,
+            'current_handler': {
+                'kind': handler['kind'],
+                'user_id': handler['user'].id if handler['user'] else None,
+                'name': handler['user'].display_name if handler['user'] else None,
+                'owner_id': handler['owner'].id if handler['owner'] else None,
+                'owner_name': handler['owner'].display_name if handler['owner'] else None,
+                'policy_id': handler['policy'].id if handler['policy'] else None,
+            },
+            'approvals': ApprovalSerializer(approvals, many=True).data,
+        })
+
+
+class ApprovalActionView(APIView):
+    """
+    对出库单作出审批决定（本人或代理人）。
+
+    服务层实时校验：
+    - 职责分离（申请人不得审批）；
+    - 代理授权的业务种类/金额/风险范围/有效期；
+    - 授权撤销或到期后，须重新寻找合法审批人。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            stock_out = StockOut.objects.get(pk=pk)
+        except StockOut.DoesNotExist:
+            return error_response(message='出库单不存在', code=404)
+
+        serializer = ApprovalDecisionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer.errors))
+
+        try:
+            approval = perform_approval(
+                stock_out, request.user,
+                serializer.validated_data['decision'],
+                serializer.validated_data.get('remark', ''),
+            )
+        except ApprovalError as exc:
+            return error_response(message=str(exc), code=403)
+
+        logger.info(
+            "出库单 #%s 被 %s%s，原授权人 %s",
+            stock_out.id, request.user.username,
+            '代理审批' if approval.is_delegated else '本人审批',
+            approval.approver.username if approval.approver else '-',
+        )
+        return success_response(
+            data=ApprovalSerializer(approval).data, message='审批完成')
+
+
+class ApprovalListView(APIView):
+    """审批记录列表视图"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = Approval.objects.select_related(
+            'stock_out', 'approver', 'actor', 'delegation').all()
+
+        stock_out_id = request.query_params.get('stock_out')
+        if stock_out_id:
+            qs = qs.filter(stock_out_id=stock_out_id)
+        delegated = request.query_params.get('delegated')
+        if delegated == 'true':
+            qs = qs.filter(is_delegated=True)
+        elif delegated == 'false':
+            qs = qs.filter(is_delegated=False)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        total = qs.count()
+        items = qs[start:start + page_size]
+        return success_response(data={
+            'list': ApprovalSerializer(items, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
         })
 
 
 class WarningListView(APIView):
     """预警记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
-        })
 
-
-class ApprovalListView(APIView):
-    """审批记录列表视图"""
-    permission_classes = [IsAuthenticated]
-    
     def get(self, request):
+        qs = Warning.objects.select_related('goods').all()
+        warning_type = request.query_params.get('type')
+        if warning_type:
+            qs = qs.filter(type=warning_type)
+        is_read = request.query_params.get('is_read')
+        if is_read == 'true':
+            qs = qs.filter(is_read=True)
+        elif is_read == 'false':
+            qs = qs.filter(is_read=False)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        total = qs.count()
+        items = qs[start:start + page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': WarningSerializer(items, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
         })

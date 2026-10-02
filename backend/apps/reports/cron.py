@@ -94,13 +94,27 @@ def generate_daily_report():
     logger.info(f"每日报表生成完成: {yesterday}")
 
 
+def expire_delegations():
+    """
+    代理授权到期扫描 - 定时任务
+    每小时执行，将已到失效时间的代理授权置为过期；
+    过期/撤销后未完成的审批事项在下次处理人解析时
+    自动重新寻找合法审批人（负责人本人或新代理人）。
+    """
+    from apps.delegation.models import expire_due_policies
+
+    logger.info("开始执行代理授权到期扫描...")
+    count = expire_due_policies()
+    logger.info(f"代理授权到期扫描完成，新置过期授权: {count} 条")
+
+
 def clean_old_logs():
     """
     清理旧日志 - 定时任务
     每周日凌晨3点执行，清理30天前的操作日志
     """
     from apps.authentication.models import OperationLog
-    
+
     logger.info("开始执行日志清理定时任务...")
     
     threshold_date = datetime.now() - timedelta(days=30)
