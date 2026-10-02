@@ -3,6 +3,7 @@
 """
 from django.db import models
 from apps.authentication.models import User
+from apps.delegation.models import RISK_LEVEL_CHOICES
 
 
 class Unit(models.Model):
@@ -175,6 +176,9 @@ class StockOut(models.Model):
     receiver = models.CharField('领用人', max_length=100)
     receiver_dept = models.CharField('领用部门', max_length=100, blank=True)
     quantity = models.DecimalField('出库数量', max_digits=12, decimal_places=2)
+    risk_level = models.CharField(
+        '风险等级', max_length=20, choices=RISK_LEVEL_CHOICES, default='low'
+    )
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
     stock_out_time = models.DateTimeField('出库时间', null=True, blank=True)
     remark = models.TextField('备注', blank=True)
@@ -218,13 +222,18 @@ class Warning(models.Model):
 
 
 class Approval(models.Model):
-    """审批记录模型"""
+    """
+    审批记录模型
+
+    approver 为审批人（原授权人），代理签署时保持不变；
+    actual_operator 为实际操作人，本人审批时与审批人相同。
+    """
     STATUS_CHOICES = [
         ('pending', '待审批'),
         ('approved', '已通过'),
         ('rejected', '已拒绝'),
     ]
-    
+
     stock_out = models.ForeignKey(
         StockOut, on_delete=models.CASCADE,
         related_name='approvals', verbose_name='出库记录'
@@ -233,16 +242,58 @@ class Approval(models.Model):
         User, on_delete=models.SET_NULL, null=True,
         related_name='approvals', verbose_name='审批人'
     )
+    actual_operator = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='operated_approvals', verbose_name='实际操作人'
+    )
+    is_delegated = models.BooleanField('是否代理签署', default=False)
+    delegation = models.ForeignKey(
+        'delegation.Delegation', on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='approvals', verbose_name='使用的代理授权'
+    )
     status = models.CharField('审批状态', max_length=20, choices=STATUS_CHOICES, default='pending')
     remark = models.TextField('审批意见', blank=True)
+    decided_at = models.DateTimeField('决定时间', null=True, blank=True)
     created_at = models.DateTimeField('创建时间', auto_now_add=True)
     updated_at = models.DateTimeField('更新时间', auto_now=True)
-    
+
     class Meta:
         db_table = 'wh_approval'
         verbose_name = '审批记录'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
-    
+
     def __str__(self):
         return f"{self.stock_out} - {self.get_status_display()}"
+
+
+class ApprovalEvent(models.Model):
+    """审批流转事件模型（创建、决定、改派、退回）"""
+    EVENT_CHOICES = [
+        ('created', '审批创建'),
+        ('decided', '审批决定'),
+        ('reassigned', '审批人改派'),
+        ('reverted', '退回原审批人'),
+    ]
+
+    approval = models.ForeignKey(
+        Approval, on_delete=models.CASCADE,
+        related_name='events', verbose_name='审批记录'
+    )
+    event = models.CharField('事件类型', max_length=20, choices=EVENT_CHOICES)
+    actor = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='approval_events', verbose_name='操作人'
+    )
+    detail = models.JSONField('事件详情', default=dict)
+    created_at = models.DateTimeField('发生时间', auto_now_add=True)
+
+    class Meta:
+        db_table = 'wh_approval_event'
+        verbose_name = '审批流转事件'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.approval_id} - {self.get_event_display()}"

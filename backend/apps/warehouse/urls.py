@@ -8,7 +8,7 @@ from .views import (
     VarietyListView, VarietyDetailView, VarietyBatchDeleteView,
     VarietyTemplateView, VarietyImportView,
     DashboardView, GoodsListView, StockInListView, StockOutListView,
-    WarningListView, ApprovalListView
+    WarningListView, ApprovalListView, ApprovalDecideView
 )
 
 urlpatterns = [
@@ -48,4 +48,5 @@ urlpatterns = [
     
     # 审批管理
     path('approvals/', ApprovalListView.as_view(), name='approval-list'),
+    path('approvals/<int:pk>/decide/', ApprovalDecideView.as_view(), name='approval-decide'),
 ]

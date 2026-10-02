@@ -3,19 +3,23 @@
 """
 import logging
 import io
+from django.db import transaction
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from apps.authentication.models import User
+from apps.delegation.services import find_signing_delegation, assert_signing_sod
+from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval, ApprovalEvent
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
-    GoodsSerializer, StockInSerializer, StockOutSerializer,
+    GoodsSerializer, StockInSerializer, StockOutSerializer, StockOutCreateSerializer,
     WarningSerializer, ApprovalSerializer
 )
 
@@ -602,14 +606,83 @@ class StockInListView(APIView):
 class StockOutListView(APIView):
     """出库记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockOut.objects.select_related('goods', 'operator').order_by('-created_at')
+
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        goods_id = request.query_params.get('goods_id')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        records = queryset[start:end]
+
+        serializer = StockOutSerializer(records, many=True)
+
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
         })
+
+    def post(self, request):
+        """创建出库申请（同时生成待审批记录）"""
+        serializer = StockOutCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        goods = Goods.objects.get(pk=data['goods'])
+        approver = User.objects.get(pk=data['approver'])
+
+        if not goods.is_active:
+            return error_response(message='货物已停用')
+        if data['quantity'] > goods.quantity:
+            return error_response(message='出库数量不能超过当前库存')
+        if not approver.is_active:
+            return error_response(message='审批人账号已被禁用')
+        if not approver.is_admin:
+            return error_response(message='审批人必须具备审批权限（管理员）')
+        if approver.id == request.user.id:
+            return error_response(message='职责分离：不能指定自己审批自己的出库单')
+
+        with transaction.atomic():
+            stock_out = StockOut.objects.create(
+                goods=goods,
+                operator=request.user,
+                receiver=data['receiver'],
+                receiver_dept=data.get('receiver_dept', ''),
+                quantity=data['quantity'],
+                risk_level=data.get('risk_level', 'low'),
+                remark=data.get('remark', ''),
+            )
+            approval = Approval.objects.create(stock_out=stock_out, approver=approver)
+            ApprovalEvent.objects.create(
+                approval=approval,
+                event='created',
+                actor=request.user,
+                detail={'approver_id': approver.id, 'approver': approver.username}
+            )
+
+        logger.info(
+            f"User {request.user.username} created stock-out {stock_out.id} "
+            f"for goods {goods.code}, approver {approver.username}"
+        )
+
+        return success_response(data=StockOutSerializer(stock_out).data, message='创建成功')
 
 
 class WarningListView(APIView):
@@ -628,11 +701,118 @@ class WarningListView(APIView):
 class ApprovalListView(APIView):
     """审批记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Approval.objects.select_related(
+            'stock_out', 'stock_out__goods', 'approver', 'actual_operator', 'delegation'
+        ).order_by('-created_at')
+
+        # 非管理员只能查看自己提交的出库单对应的审批
+        if not request.user.is_admin:
+            queryset = queryset.filter(stock_out__operator=request.user)
+
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        is_delegated = request.query_params.get('is_delegated')
+        if is_delegated in ('true', 'false'):
+            queryset = queryset.filter(is_delegated=(is_delegated == 'true'))
+        approver_id = request.query_params.get('approver_id')
+        if approver_id:
+            queryset = queryset.filter(approver_id=approver_id)
+        actual_operator_id = request.query_params.get('actual_operator_id')
+        if actual_operator_id:
+            queryset = queryset.filter(actual_operator_id=actual_operator_id)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        approvals = queryset[start:end]
+
+        serializer = ApprovalSerializer(approvals, many=True)
+
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
         })
+
+
+class ApprovalDecideView(APIView):
+    """审批决定视图（支持本人审批与代理签署）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        approval = Approval.objects.select_related('stock_out', 'approver').filter(pk=pk).first()
+        if not approval:
+            return error_response(message='审批记录不存在', code=404)
+        if approval.status != 'pending':
+            return error_response(message='该审批已处理，请勿重复操作')
+
+        action = request.data.get('action')
+        if action not in ('approved', 'rejected'):
+            return error_response(message='无效的审批动作')
+        remark = str(request.data.get('remark', ''))
+
+        user = request.user
+        delegation = None
+        if approval.approver_id == user.id:
+            # 本人直接审批
+            pass
+        else:
+            # 代理签署：必须持有根植于该审批人的有效授权
+            delegation = find_signing_delegation(user=user, approval=approval)
+            if delegation is None:
+                return error_response(message='您不是该审批的审批人，且没有可用的代理授权', code=403)
+
+        # 职责分离：出库操作人不得参与该单的决定（本人或授权链任一环节）
+        assert_signing_sod(approval=approval, signer=user, delegation=delegation)
+
+        now = timezone.now()
+        with transaction.atomic():
+            approval.status = action
+            approval.actual_operator = user
+            approval.is_delegated = delegation is not None
+            approval.delegation = delegation
+            approval.decided_at = now
+            approval.remark = remark
+            approval.save()
+
+            stock_out = approval.stock_out
+            stock_out.status = action
+            stock_out.save(update_fields=['status'])
+
+            ApprovalEvent.objects.create(
+                approval=approval,
+                event='decided',
+                actor=user,
+                detail={
+                    'action': action,
+                    'actual_operator_id': user.id,
+                    'actual_operator': user.username,
+                    'original_grantor_id': approval.approver_id,
+                    'original_grantor': approval.approver.username if approval.approver else None,
+                    'is_delegated': delegation is not None,
+                    'delegation_chain': [
+                        {
+                            'delegation_id': link.id,
+                            'grantor_id': link.grantor_id,
+                            'grantor': link.grantor.username,
+                            'agent_id': link.agent_id,
+                            'agent': link.agent.username,
+                        }
+                        for link in delegation.get_chain()
+                    ] if delegation else [],
+                }
+            )
+
+        logger.info(
+            f"User {user.username} decided approval {approval.id}: {action} "
+            f"(delegated={delegation is not None})"
+        )
+
+        return success_response(data=ApprovalSerializer(approval).data, message='审批完成')

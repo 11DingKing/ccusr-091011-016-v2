@@ -127,6 +127,7 @@ class OperationLogMiddleware:
             '/api/attendance-persons/': '考勤人员管理',
             '/api/stock-out-persons/': '出库人员管理',
             '/api/approvals/': '审批管理',
+            '/api/delegations/': '代理授权',
             '/api/warnings/': '预警管理',
         }
         
